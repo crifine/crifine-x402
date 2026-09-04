@@ -1,0 +1,7 @@
+# Anchors this package as its own pnpm root. Without it pnpm walks up to the
+# home directory's workspace and tries to link this package into it.
+packages: []
+
+# esbuild ships a prebuilt binary that tsx needs at test time.
+allowBuilds:
+  esbuild: true

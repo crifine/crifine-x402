@@ -1,0 +1,48 @@
+{
+  "name": "@crifine/x402",
+  "version": "0.1.0",
+  "description": "A fetch wrapper that handles 402 Payment Required — pay per request in USDC, with spend limits that are not optional.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "viem": "^2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "viem": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "viem": "^2.56.3"
+  },
+  "keywords": [
+    "x402",
+    "micropayments",
+    "usdc",
+    "agents",
+    "fetch"
+  ],
+  "packageManager": "pnpm@11.8.0"
+}

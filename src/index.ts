@@ -1,0 +1,205 @@
+/**
+ * `402 Payment Required` → pay → retry, as a `fetch` wrapper.
+ *
+ * ── The constraint that shapes this package ──────────────────────────────
+ * This library spends money automatically, on behalf of a program that may run
+ * unattended for hours. Every design choice below follows from that:
+ *
+ * - `maxPerCall` is **required and has no default**. There is deliberately no
+ *   code path in which this wrapper pays an amount the caller did not bound.
+ * - It never holds a key. Settlement is a callback the caller supplies.
+ * - It pays at most once per request, and never retries a payment.
+ * - Refusals throw typed errors, so an agent can tell "too expensive" apart
+ *   from "the server is broken".
+ *
+ * It works with any API that speaks x402, not just Crifine — which is why it
+ * has no dependency on `@crifine/sdk`.
+ */
+
+import {
+  BudgetExhaustedError,
+  HostNotAllowedError,
+  MalformedTermsError,
+  SpendLimitError,
+  X402Error,
+} from "./errors.js";
+import type { PaymentEvent, PaymentRequest, PaymentReceipt, Settle } from "./types.js";
+
+export * from "./types.js";
+export * from "./errors.js";
+export * from "./settlers.js";
+
+export type X402Options = {
+  /**
+   * Hard ceiling for a single call, in the currency the server quotes.
+   * Required: a wrapper that pays an unbounded amount is not something a
+   * caller can reason about.
+   */
+  maxPerCall: number;
+  /** Settles payment. Without it, a 402 is returned to the caller untouched. */
+  settle?: Settle;
+  /** Cumulative ceiling across the life of this wrapper. */
+  maxTotal?: number;
+  /** Hosts allowed to charge. Omit to allow any. */
+  allowHosts?: string[];
+  /** Audit hook, called after each successful settlement. */
+  onPayment?: (event: PaymentEvent) => void;
+  /**
+   * Most payments in flight at once. Default 1.
+   *
+   * Serialised by default on purpose: with parallel calls, two 402s can both
+   * read the budget before either has spent, and the pair sails past a limit
+   * each of them individually respected. An unattended agent fanning out ten
+   * requests would blow through `maxTotal` without a single check failing.
+   * Raise it only if you can tolerate that.
+   */
+  concurrency?: number;
+  /** Underlying fetch. Defaults to global. */
+  fetch?: typeof fetch;
+};
+
+/** Reads the terms a server states in its 402 headers. */
+export function readTerms(response: Response): PaymentRequest {
+  const amount = Number(response.headers.get("x-payment-amount"));
+  const currency = response.headers.get("x-payment-currency");
+  const network = response.headers.get("x-payment-network");
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new MalformedTermsError("X-Payment-Amount is missing or not a positive number");
+  }
+  if (!currency) throw new MalformedTermsError("X-Payment-Currency is missing");
+  if (!network) throw new MalformedTermsError("X-Payment-Network is missing");
+
+  const recipient = response.headers.get("x-payment-recipient");
+  const nonce = response.headers.get("x-payment-nonce");
+
+  return {
+    amount,
+    currency,
+    network,
+    ...(recipient ? { recipient } : {}),
+    ...(nonce ? { nonce } : {}),
+  };
+}
+
+export type X402Fetch = typeof fetch & {
+  /** Total settled by this wrapper so far. */
+  readonly spent: number;
+  /** Number of payments settled. */
+  readonly payments: number;
+  /** Every settlement, in order. An audit trail without wiring a callback. */
+  readonly receipts: readonly PaymentEvent[];
+  /** Remaining budget, or Infinity when no `maxTotal` was set. */
+  readonly remaining: number;
+};
+
+export function x402Fetch(options: X402Options): X402Fetch {
+  if (!(options.maxPerCall > 0)) {
+    throw new X402Error(
+      "maxPerCall is required and must be greater than zero — this wrapper will not pay an unbounded amount",
+    );
+  }
+
+  const doFetch = options.fetch ?? fetch;
+  const allowed = options.allowHosts?.map((host) => host.toLowerCase());
+
+  let spent = 0;
+  let payments = 0;
+  const receipts: PaymentEvent[] = [];
+
+  // A promise chain, not a counter: the point is that budget checks and the
+  // spend that follows them cannot interleave.
+  const limit = Math.max(1, options.concurrency ?? 1);
+  let running = 0;
+  const queue: (() => void)[] = [];
+
+  const acquire = async () => {
+    if (running < limit) {
+      running += 1;
+      return;
+    }
+    await new Promise<void>((resolve) => queue.push(resolve));
+    running += 1;
+  };
+
+  const release = () => {
+    running -= 1;
+    queue.shift()?.();
+  };
+
+  // Derived from `fetch` itself rather than naming `RequestInfo`, which is a
+  // DOM global and is not declared by @types/node.
+  type FetchInput = Parameters<typeof fetch>[0];
+
+  const wrapped = (async (input: FetchInput, init?: RequestInit) => {
+    const first = await doFetch(input, init);
+    if (first.status !== 402) return first;
+    if (!options.settle) return first;
+
+    const url = new URL(
+      typeof input === "string" || input instanceof URL ? String(input) : input.url,
+    );
+
+    if (allowed && !allowed.includes(url.host.toLowerCase())) {
+      throw new HostNotAllowedError(url.host);
+    }
+
+    // Terms are read before any spend decision so a malformed 402 can never be
+    // paid "just in case".
+    const terms = readTerms(first);
+
+    if (terms.amount > options.maxPerCall) {
+      throw new SpendLimitError(terms.amount, options.maxPerCall, terms.currency);
+    }
+
+    await acquire();
+    let receipt: PaymentReceipt;
+    let event: PaymentEvent;
+
+    try {
+      // Re-checked inside the gate: another call may have spent while this one
+      // waited, and the budget it was checked against is now stale.
+      if (options.maxTotal !== undefined && spent + terms.amount > options.maxTotal) {
+        throw new BudgetExhaustedError(spent, options.maxTotal, terms.currency);
+      }
+
+      receipt = await options.settle(terms);
+
+      // The ledger moves on the receipt, not the quote: if settlement came
+      // back with a different amount, that is what was actually spent.
+      spent += receipt.amount;
+      payments += 1;
+      event = { url: url.toString(), request: terms, receipt, spentTotal: spent };
+      receipts.push(event);
+    } finally {
+      release();
+    }
+
+    options.onPayment?.(event);
+
+    const headers = new Headers(init?.headers);
+    headers.set("x-payment-proof", receipt.proof);
+
+    const retried = await doFetch(input, { ...init, headers });
+
+    // One payment per request, always. A second 402 is handed back rather than
+    // paid again — an endpoint that keeps asking is a bug, and paying into a
+    // loop is how an unattended agent empties a wallet.
+    return retried;
+  }) as X402Fetch;
+
+  Object.defineProperties(wrapped, {
+    spent: { get: () => spent, enumerable: true },
+    payments: { get: () => payments, enumerable: true },
+    receipts: { get: () => [...receipts], enumerable: true },
+    remaining: {
+      get: () =>
+        options.maxTotal === undefined
+          ? Number.POSITIVE_INFINITY
+          : Math.max(0, options.maxTotal - spent),
+      enumerable: true,
+    },
+  });
+
+  return wrapped;
+}
