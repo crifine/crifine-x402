@@ -87,6 +87,36 @@ The settler refuses rather than guesses: an unknown network, a missing
 recipient, or a currency other than USDC all throw before anything moves. It
 converts amounts through strings, so `0.004` never becomes `0.004000000000001`.
 
+## Find out what a run would cost, before it costs anything
+
+```ts
+const dry = x402Fetch({ maxPerCall: 0.01, dryRun: true, settle });
+
+await dry("https://api.crifine.app/v1/exit/aave-v3-weth?size_usd=5000000");
+
+dry.spent;      // 0 — nothing was settled
+dry.receipts;   // the quotes, each with proof "dry-run"
+```
+
+A library that spends money automatically should be runnable once with the
+spending switched off. Dry run still parses the 402 and still checks **every**
+limit, so a run that would have been refused is still refused — otherwise it
+would tell you a real run is fine when it is not.
+
+## Audit what was stopped, not just what moved
+
+```ts
+x402Fetch({
+  maxPerCall: 0.01,
+  settle,
+  onPayment: (event) => log.info("paid", event),
+  onRefusal: ({ url, error }) => log.warn("refused", url, error.name),
+});
+```
+
+Without `onRefusal` the trail only shows the money that moved, never the money
+that was stopped — which is the half that tells you a limit is doing its job.
+
 ## Errors
 
 | Error | Meaning | What an agent should do |
@@ -126,7 +156,7 @@ you can build against it. See the
 
 ```bash
 pnpm install
-pnpm test    # 18 tests, most of them about what it refuses to do
+pnpm test    # 29 tests, most of them about what it refuses to do
 ```
 
 MIT.
