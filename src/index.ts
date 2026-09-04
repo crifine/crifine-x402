@@ -54,6 +54,22 @@ export type X402Options = {
    * Raise it only if you can tolerate that.
    */
   concurrency?: number;
+  /**
+   * Report what would be paid, and pay nothing.
+   *
+   * A library that spends money automatically should be runnable once with the
+   * spending switched off. In dry run the 402 is still parsed and still checked
+   * against every limit — so a run that would have been refused is still
+   * refused — and the quote is recorded in `receipts` with a `proof` of
+   * `"dry-run"`. The original 402 is returned; no retry is made.
+   */
+  dryRun?: boolean;
+  /**
+   * Called when a payment is refused. Pairs with `onPayment`: without it, the
+   * audit trail only shows the money that moved, never the money that was
+   * stopped.
+   */
+  onRefusal?: (refusal: { url: string; request: PaymentRequest; error: X402Error }) => void;
   /** Underlying fetch. Defaults to global. */
   fetch?: typeof fetch;
 };
@@ -141,15 +157,27 @@ export function x402Fetch(options: X402Options): X402Fetch {
     );
 
     if (allowed && !allowed.includes(url.host.toLowerCase())) {
-      throw new HostNotAllowedError(url.host);
+      const error = new HostNotAllowedError(url.host);
+      options.onRefusal?.({
+        url: url.toString(),
+        // Terms are not trusted from a host we refused to talk to.
+        request: { amount: 0, currency: "", network: "" },
+        error,
+      });
+      throw error;
     }
 
     // Terms are read before any spend decision so a malformed 402 can never be
     // paid "just in case".
     const terms = readTerms(first);
 
+    const refuse = (error: X402Error): never => {
+      options.onRefusal?.({ url: url.toString(), request: terms, error });
+      throw error;
+    };
+
     if (terms.amount > options.maxPerCall) {
-      throw new SpendLimitError(terms.amount, options.maxPerCall, terms.currency);
+      refuse(new SpendLimitError(terms.amount, options.maxPerCall, terms.currency));
     }
 
     await acquire();
@@ -160,7 +188,26 @@ export function x402Fetch(options: X402Options): X402Fetch {
       // Re-checked inside the gate: another call may have spent while this one
       // waited, and the budget it was checked against is now stale.
       if (options.maxTotal !== undefined && spent + terms.amount > options.maxTotal) {
-        throw new BudgetExhaustedError(spent, options.maxTotal, terms.currency);
+        refuse(new BudgetExhaustedError(spent, options.maxTotal, terms.currency));
+      }
+
+      // Every limit has now been checked. In dry run that is the whole job:
+      // record the quote, spend nothing, and hand back the 402 unchanged.
+      if (options.dryRun) {
+        const quote: PaymentEvent = {
+          url: url.toString(),
+          request: terms,
+          receipt: {
+            proof: "dry-run",
+            amount: terms.amount,
+            currency: terms.currency,
+            network: terms.network,
+          },
+          spentTotal: spent,
+        };
+        receipts.push(quote);
+        options.onPayment?.(quote);
+        return first;
       }
 
       receipt = await options.settle(terms);

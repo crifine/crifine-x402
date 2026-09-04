@@ -368,3 +368,124 @@ test("the receipt list cannot be mutated from outside", async () => {
   (pay.receipts as unknown as unknown[]).push("forged");
   assert.equal(pay.receipts.length, 1, "the audit trail must not be editable");
 });
+
+/* ── Dry run ────────────────────────────────────────────────────────────── */
+
+test("dry run reports the quote and spends nothing", async () => {
+  const server = payingServer();
+  let settled = false;
+
+  const pay = x402Fetch({
+    maxPerCall: 0.01,
+    dryRun: true,
+    settle: async (r) => {
+      settled = true;
+      return settle(r);
+    },
+    fetch: server.doFetch,
+  });
+
+  const response = await pay("https://api.example.com/x");
+
+  assert.equal(settled, false, "dry run must never settle");
+  assert.equal(pay.spent, 0);
+  assert.equal(response.status, 402, "the original 402 is handed back, not a retry");
+  assert.equal(server.calls.length, 1, "no retry is made");
+
+  assert.equal(pay.receipts.length, 1);
+  assert.equal(pay.receipts[0]!.receipt.proof, "dry-run");
+  assert.equal(pay.receipts[0]!.receipt.amount, 0.004);
+});
+
+test("dry run still refuses what a real run would refuse", async () => {
+  // The point of a dry run is to find out whether a real run would work, so a
+  // limit that would stop a payment must stop the dry run too.
+  const overLimit = x402Fetch({
+    maxPerCall: 0.001,
+    dryRun: true,
+    settle,
+    fetch: (async () => terms(0.004)) as typeof fetch,
+  });
+  await assert.rejects(() => overLimit("https://api.example.com/x"), SpendLimitError);
+
+  const overBudget = x402Fetch({
+    maxPerCall: 1,
+    maxTotal: 0.001,
+    dryRun: true,
+    settle,
+    fetch: (async () => terms(0.004)) as typeof fetch,
+  });
+  await assert.rejects(() => overBudget("https://api.example.com/x"), BudgetExhaustedError);
+
+  const wrongHost = x402Fetch({
+    maxPerCall: 1,
+    dryRun: true,
+    allowHosts: ["api.crifine.app"],
+    settle,
+    fetch: (async () => terms(0.004)) as typeof fetch,
+  });
+  await assert.rejects(() => wrongHost("https://evil.example.com/x"), HostNotAllowedError);
+});
+
+test("dry run totals a run without paying for it", async () => {
+  const pay = x402Fetch({
+    maxPerCall: 1,
+    dryRun: true,
+    settle,
+    fetch: (async () => terms(0.004)) as typeof fetch,
+  });
+
+  for (const path of ["a", "b", "c"]) await pay(`https://api.example.com/${path}`);
+
+  const quoted = pay.receipts.reduce((total, r) => total + r.receipt.amount, 0);
+  assert.ok(Math.abs(quoted - 0.012) < 1e-9, "the run would have cost 0.012");
+  assert.equal(pay.spent, 0);
+});
+
+/* ── Refusal auditing ───────────────────────────────────────────────────── */
+
+test("onRefusal sees the money that was stopped, not just the money that moved", async () => {
+  const refusals: { url: string; name: string }[] = [];
+
+  const pay = x402Fetch({
+    maxPerCall: 0.001,
+    settle,
+    onRefusal: ({ url, error }) => refusals.push({ url, name: error.name }),
+    fetch: (async () => terms(0.004)) as typeof fetch,
+  });
+
+  await assert.rejects(() => pay("https://api.example.com/x"));
+  assert.deepEqual(refusals, [
+    { url: "https://api.example.com/x", name: "SpendLimitError" },
+  ]);
+});
+
+test("a budget refusal is audited too", async () => {
+  const names: string[] = [];
+  const server = payingServer();
+  const pay = x402Fetch({
+    maxPerCall: 1,
+    maxTotal: 0.005,
+    settle,
+    onRefusal: ({ error }) => names.push(error.name),
+    fetch: server.doFetch,
+  });
+
+  await pay("https://api.example.com/a");
+  await assert.rejects(() => pay("https://api.example.com/b"));
+  assert.deepEqual(names, ["BudgetExhaustedError"]);
+});
+
+test("a disallowed host is audited without trusting its stated terms", async () => {
+  let seen: { amount: number } | undefined;
+  const pay = x402Fetch({
+    maxPerCall: 1,
+    allowHosts: ["api.crifine.app"],
+    settle,
+    onRefusal: ({ request }) => { seen = request; },
+    fetch: (async () => terms(999)) as typeof fetch,
+  });
+
+  await assert.rejects(() => pay("https://evil.example.com/x"), HostNotAllowedError);
+  assert.equal(seen?.amount, 0, "terms from a refused host must not be reported as real");
+});
