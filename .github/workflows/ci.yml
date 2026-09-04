@@ -4,19 +4,27 @@ on:
   push: { branches: [main] }
   pull_request:
 
+# No publishing here — this workflow only proves the code builds and its tests
+# pass. Releasing to npm is a deliberate, manual act.
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # setup-node comes FIRST. pnpm/action-setup runs `pnpm store path` while
+      # it installs, using whatever node is already on the runner — and the
+      # runner default (20) is below the 22.13 that pnpm 11 requires, so that
+      # step dies with ERR_UNKNOWN_BUILTIN_MODULE: node:sqlite.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       # No `version:` here on purpose — package.json's `packageManager`
       # field is the single source of truth, and specifying both makes
       # pnpm/action-setup fail with a version conflict.
       - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: pnpm
+
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
