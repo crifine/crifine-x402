@@ -117,6 +117,21 @@ x402Fetch({
 Without `onRefusal` the trail only shows the money that moved, never the money
 that was stopped — which is the half that tells you a limit is doing its job.
 
+## Carve a budget per task
+
+```ts
+const day = x402Fetch({ maxPerCall: 0.01, maxTotal: 50, settle });
+
+const task = day.withBudget(2);   // this task may spend 2, no more
+await task("https://api.crifine.app/v1/exit/aave-v3-weth?size_usd=5000000");
+
+day.spent;   // the parent sees everything its children spent
+```
+
+A child settles **through** its parent, so both ledgers move together and the
+parent ceiling stays real. A child can tighten `maxPerCall` but never loosen it
+— otherwise the parent's limit would be advisory.
+
 ## Errors
 
 | Error | Meaning | What an agent should do |
@@ -156,7 +171,7 @@ you can build against it. See the
 
 ```bash
 pnpm install
-pnpm test    # 29 tests, most of them about what it refuses to do
+pnpm test    # 35 tests, most of them about what it refuses to do
 ```
 
 MIT.
