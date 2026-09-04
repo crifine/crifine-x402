@@ -109,7 +109,19 @@ export type X402Fetch = typeof fetch & {
   readonly remaining: number;
 };
 
-export function x402Fetch(options: X402Options): X402Fetch {
+export type ScopedX402Fetch = X402Fetch & {
+  /**
+   * A child wrapper with a tighter budget of its own, spending from the same
+   * ledger as its parent.
+   *
+   * The case this exists for: one long-lived wrapper holds the day's budget,
+   * and each task carves off a slice it cannot exceed. Without it, a task that
+   * misbehaves can only be bounded by the whole day's allowance.
+   */
+  withBudget: (maxTotal: number, overrides?: Partial<X402Options>) => ScopedX402Fetch;
+};
+
+export function x402Fetch(options: X402Options): ScopedX402Fetch {
   if (!(options.maxPerCall > 0)) {
     throw new X402Error(
       "maxPerCall is required and must be greater than zero — this wrapper will not pay an unbounded amount",
@@ -233,9 +245,47 @@ export function x402Fetch(options: X402Options): X402Fetch {
     // paid again — an endpoint that keeps asking is a bug, and paying into a
     // loop is how an unattended agent empties a wallet.
     return retried;
-  }) as X402Fetch;
+  }) as ScopedX402Fetch;
+
+  // A child settles through the parent, so both ledgers move together and the
+  // parent's ceiling still binds. A child that kept its own settle callback
+  // could spend past a parent limit without the parent ever noticing.
+  const withBudget = (maxTotal: number, overrides: Partial<X402Options> = {}): ScopedX402Fetch => {
+    if (!(maxTotal > 0)) {
+      throw new X402Error("a scoped budget must be greater than zero");
+    }
+
+    let scopedSpent = 0;
+
+    return x402Fetch({
+      ...options,
+      ...overrides,
+      maxPerCall: Math.min(
+        overrides.maxPerCall ?? options.maxPerCall,
+        options.maxPerCall,
+      ),
+      maxTotal,
+      settle: async (request) => {
+        if (scopedSpent + request.amount > maxTotal) {
+          throw new BudgetExhaustedError(scopedSpent, maxTotal, request.currency);
+        }
+        if (!options.settle) {
+          throw new X402Error("the parent wrapper has no settle callback");
+        }
+
+        const receipt = await options.settle(request);
+        scopedSpent += receipt.amount;
+
+        // Charged to the parent as well, so its ceiling is real.
+        spent += receipt.amount;
+        payments += 1;
+        return receipt;
+      },
+    });
+  };
 
   Object.defineProperties(wrapped, {
+    withBudget: { value: withBudget, enumerable: true },
     spent: { get: () => spent, enumerable: true },
     payments: { get: () => payments, enumerable: true },
     receipts: { get: () => [...receipts], enumerable: true },

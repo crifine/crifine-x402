@@ -489,3 +489,67 @@ test("a disallowed host is audited without trusting its stated terms", async () 
   await assert.rejects(() => pay("https://evil.example.com/x"), HostNotAllowedError);
   assert.equal(seen?.amount, 0, "terms from a refused host must not be reported as real");
 });
+
+/* ── Scoped budgets ─────────────────────────────────────────────────────── */
+
+test("a child budget cannot outspend its own ceiling", async () => {
+  const server = payingServer();
+  const parent = x402Fetch({ maxPerCall: 1, maxTotal: 10, settle, fetch: server.doFetch });
+  const task = parent.withBudget(0.005);
+
+  await task("https://api.example.com/a");
+  await assert.rejects(() => task("https://api.example.com/b"), BudgetExhaustedError);
+});
+
+test("a child spends from the parent ledger, so the parent ceiling still binds", async () => {
+  const server = payingServer();
+  const parent = x402Fetch({ maxPerCall: 1, maxTotal: 10, settle, fetch: server.doFetch });
+  const task = parent.withBudget(1);
+
+  await task("https://api.example.com/a");
+  assert.equal(parent.spent, 0.004, "the parent must see what its child spent");
+  assert.equal(parent.payments, 1);
+});
+
+test("a child cannot loosen the parent per-call limit", async () => {
+  // A child that could raise maxPerCall would make the parent's limit advisory.
+  const parent = x402Fetch({
+    maxPerCall: 0.001,
+    settle,
+    fetch: (async () => terms(0.004)) as typeof fetch,
+  });
+  const task = parent.withBudget(1, { maxPerCall: 1 });
+
+  await assert.rejects(() => task("https://api.example.com/x"), SpendLimitError);
+});
+
+test("a child can tighten the per-call limit", async () => {
+  const parent = x402Fetch({
+    maxPerCall: 1,
+    settle,
+    fetch: (async () => terms(0.004)) as typeof fetch,
+  });
+  const task = parent.withBudget(1, { maxPerCall: 0.001 });
+
+  await assert.rejects(() => task("https://api.example.com/x"), SpendLimitError);
+});
+
+test("a non-positive scoped budget is refused", () => {
+  const parent = x402Fetch({ maxPerCall: 1, settle });
+  assert.throws(() => parent.withBudget(0), X402Error);
+  assert.throws(() => parent.withBudget(-1), X402Error);
+});
+
+test("siblings do not share each other's budget", async () => {
+  const server = payingServer();
+  const parent = x402Fetch({ maxPerCall: 1, maxTotal: 10, settle, fetch: server.doFetch });
+  const a = parent.withBudget(0.005);
+  const b = parent.withBudget(0.005);
+
+  await a("https://api.example.com/a");
+  await assert.rejects(() => a("https://api.example.com/a2"), BudgetExhaustedError);
+
+  // b is untouched by a's exhaustion.
+  await b("https://api.example.com/b");
+  assert.equal(parent.spent, 0.008);
+});
